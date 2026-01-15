@@ -1,0 +1,555 @@
+%% ========================================================================
+%  V2I Rectangular-Pulse ZP-OTFS Echo Sensing (2 Lanes, Range-Gated)
+%  Coarse-to-Fine Angle Estimation with STRICT lane-DD confirmation
+%
+%  PLOT UPGRADES:
+%   - DD plots: Lane-A/B shaded bands + labels (NO A*/B* circle markers)
+%
+%  MUSIC PRECISION UPGRADES:
+%   - thetaFineStep = 0.01 deg (default)
+%   - parabolic sub-grid peak refinement on MUSIC spectrum
+%% ========================================================================
+
+clear; clc; close all;
+rng(1);
+
+%% ---------------- Constants ----------------
+c  = 3e8;
+
+%% ---------------- OTFS parameters ----------------
+N  = 128;             % Doppler bins
+M  = 256;             % Delay bins
+df = 240e3;           % subcarrier spacing (Hz)
+Fs = M*df;            % sampling rate
+Ts = 1/Fs;
+
+B  = M*df;
+dR = c/(2*B);         % monostatic range resolution (m per delay bin)
+
+% ---- "design" sensing range only for ZP length ----
+Rmax_design   = 180;                   % meters (used to set tauMax & Lzp)
+tauMax = 2*Rmax_design/c;
+Lzp    = ceil(tauMax*Fs) + 16;
+Lzp    = max(Lzp, 64);
+
+fprintf('OTFS: N=%d, M=%d, df=%.0f kHz, B=%.2f MHz, Fs=%.2f MHz, Lzp=%d\n',...
+    N,M,df/1e3,B/1e6,Fs/1e6,Lzp);
+fprintf('Monostatic range resolution ΔR=c/(2B)=%.2f m\n', dR);
+
+dNu = df/N;                      % Doppler resolution (Hz)
+fc = 60e9;                        % carrier
+lambda = c/fc;
+vBin = (dNu*lambda)/2;           % m/s per Doppler bin
+fprintf('Doppler resolution Δν=%.1f Hz, velocity per bin ≈ %.2f m/s\n', dNu, vBin);
+
+%% ---------------- Array ----------------
+Nr = 8;
+Nt = 8;
+d  = lambda/2;
+wTx = ones(Nt,1)/sqrt(Nt);       % wide Tx beam (broadcast)
+
+%% ---------------- DD-domain broadcast data (QPSK) ----------------
+bits = randi([0 1], N*M*2, 1);
+sym  = (1-2*bits(1:2:end)) + 1j*(1-2*bits(2:2:end));
+Xdd  = reshape(sym/sqrt(2), N, M);
+
+%% ---------------- Rectangular-pulse ZP-OTFS modulation ----------------
+xTx = otfs_zp_mod_rect(Xdd, N, M, Lzp);      % Nsamp x 1
+Nsamp = length(xTx);
+t = (0:Nsamp-1).' * Ts;
+fprintf('Waveform: Nsamp=%d, frame duration=%.3f ms\n', Nsamp, Nsamp*Ts*1e3);
+
+%% ========================================================================
+%  TWO LANES (RANGE-GATED) WITH MIDDLE GAP
+%% ========================================================================
+R_laneA_min = 25;   R_laneA_max = 65;      % Lane A (near)
+R_gap_min   = 65;   R_gap_max   = 75;      % middle gap (ignored)
+R_laneB_min = 75;   R_laneB_max = 115;     % Lane B (far)
+
+fprintf('\nLane A = [%.1f, %.1f] m\n', R_laneA_min, R_laneA_max);
+fprintf('GAP    = [%.1f, %.1f] m (ignored)\n', R_gap_min, R_gap_max);
+fprintf('Lane B = [%.1f, %.1f] m\n\n', R_laneB_min, R_laneB_max);
+
+% convert to delay-bin indices (1-based)
+mA_min = max(1, floor(R_laneA_min/dR) + 1);
+mA_max = min(M,  ceil(R_laneA_max/dR) + 1);
+mB_min = max(1, floor(R_laneB_min/dR) + 1);
+mB_max = min(M,  ceil(R_laneB_max/dR) + 1);
+
+fprintf('Lane A delay bins m=[%d, %d]\n', mA_min, mA_max);
+fprintf('Lane B delay bins m=[%d, %d]\n', mB_min, mB_max);
+
+mA = mA_min:mA_max;
+mB = mB_min:mB_max;
+
+%% ========================================================================
+%  CHANNEL: 2 VEHICLES (IN LANES) + 2 STATIC SCATTERERS
+%% ========================================================================
+yRx = zeros(Nr, Nsamp);
+
+veh(1).name   = 'Truck (Lane A)';
+veh(1).R0     = 35;            % inside Lane A
+veh(1).theta  =  20.5;           % deg
+veh(1).v      = 10;            % m/s
+veh(1).RCS    = 200;
+
+veh(2).name   = 'Car (Lane B)';
+veh(2).R0     = 110;           % inside Lane B
+veh(2).theta  = -25;           % deg
+veh(2).v      = -50;           % m/s
+veh(2).RCS    = 50;
+
+assert(veh(1).R0 >= R_laneA_min && veh(1).R0 <= R_laneA_max, 'Truck is NOT in Lane A gate!');
+assert(veh(2).R0 >= R_laneB_min && veh(2).R0 <= R_laneB_max, 'Car is NOT in Lane B gate!');
+
+% vehicles
+for u = 1:2
+    Rp  = veh(u).R0;
+    th  = veh(u).theta;
+    vv  = veh(u).v;
+    RCS = veh(u).RCS;
+
+    tau = 2*Rp/c;
+    fD  = 2*vv/lambda;
+
+    amp = sqrt(RCS) * (lambda/(4*pi*Rp))^2;
+
+    aRx = steering_ula(Nr, d, lambda, th);
+    aTx = steering_ula(Nt, d, lambda, th);
+    gTx = (aTx') * wTx;
+
+    x_del = frac_delay_linear(xTx, tau, Fs);
+    x_dop = x_del .* exp(1j*2*pi*fD*t);
+
+    yRx = yRx + amp * (aRx * ((gTx*x_dop).'));
+
+    fprintf('%s: R=%.1fm, theta=%.1fdeg, v=%.2fm/s\n', veh(u).name, Rp, th, vv);
+end
+
+% scatterers
+sc(1).R     =  45;     sc(1).theta =  55;   sc(1).v = 0;   sc(1).RCS = 50; % Lane A static
+sc(2).R     =  90;     sc(2).theta = -60;   sc(2).v = 0;   sc(2).RCS = 50; % Lane B static
+
+for p = 1:2
+    Rp  = sc(p).R;
+    th  = sc(p).theta;
+    vv  = sc(p).v;
+    RCS = sc(p).RCS;
+
+    tau = 2*Rp/c;
+    fD  = 2*vv/lambda;
+
+    amp = sqrt(RCS) * (lambda/(4*pi*Rp))^2;
+
+    aRx = steering_ula(Nr, d, lambda, th);
+    aTx = steering_ula(Nt, d, lambda, th);
+    gTx = (aTx') * wTx;
+
+    x_del = frac_delay_linear(xTx, tau, Fs);
+    x_dop = x_del .* exp(1j*2*pi*fD*t);
+
+    yRx = yRx + amp * (aRx * ((gTx*x_dop).'));
+
+    fprintf('Scatterer %d: R=%.1fm, theta=%.1fdeg, v=%.1fm/s\n', p, Rp, th, vv);
+end
+
+%% ---------------- Add noise ----------------
+SNRdB = 15;
+sigPow = mean(abs(yRx(:)).^2);
+noisePow = sigPow / (10^(SNRdB/10));
+yRx = yRx + sqrt(noisePow/2) * (randn(size(yRx))+1j*randn(size(yRx)));
+fprintf('Added noise: SNR=%.1f dB\n', SNRdB);
+
+%% ========================================================================
+%  Per-antenna OTFS demod + DD MF once -> Zant_fix
+%% ========================================================================
+Xspec = fft2(Xdd);
+Zant = zeros(N, M, Nr);
+
+for r = 1:Nr
+    Ydd_r = otfs_zp_demod_rect(yRx(r,:).', N, M, Lzp);
+    Zdd_r = ifft2( fft2(Ydd_r) .* conj(Xspec) );
+    Zant(:,:,r) = Zdd_r;
+end
+
+Zant_fix = zeros(N, M, Nr);
+for r = 1:Nr
+    Zs   = fftshift(Zant(:,:,r), 1);
+    Zfix = local_wrapfix_map(Zs, N, M);
+    Zant_fix(:,:,r) = Zfix;
+end
+
+%% ========================================================================
+%  Doppler gating
+%% ========================================================================
+n0 = N/2 + 1;
+
+% Lane A: exclude n0 to suppress static
+nA = [n0-1, n0+1];
+nA = nA(nA>=1 & nA<=N);
+
+% Lane B: auto-find strongest motion Doppler row inside Lane-B gate
+dNkB = 2;
+nB = estimate_motion_doppler_gate(Zant_fix, mB, n0, dNkB);
+
+fprintf('Doppler gates: LaneA n=%s (exclude n0), LaneB n=%s (motion-peak)\n', mat2str(nA), mat2str(nB));
+
+%% ========================================================================
+%  Stage-0: STRICT lane DD confirmation (find the target DD cell per lane)
+%% ========================================================================
+dNd_local = 2;  % Doppler half-window
+dMd_local = 3;  % Delay  half-window
+
+[nA_star, mA_star, EA_star] = pick_ddcell_in_lane(Zant_fix, nA, mA, dR);
+[nB_star, mB_star, EB_star] = pick_ddcell_in_lane(Zant_fix, nB, mB, dR);
+
+fprintf('\nLane-A confirmed DD cell: (n=%d, m=%d), metric=%.3e\n', nA_star, mA_star, EA_star);
+fprintf('Lane-B confirmed DD cell: (n=%d, m=%d), metric=%.3e\n\n', nB_star, mB_star, EB_star);
+
+%% ========================================================================
+%  Stage-1: COARSE angle by lane-consistent spatial MF score
+%% ========================================================================
+thetaGridCoarse = -90:2:90;
+
+[thetaA_coarse, scoreA_curve] = coarse_theta_by_lane_spatialMF(Zant_fix, nA, mA, thetaGridCoarse, Nr, d, lambda, dR);
+[thetaB_coarse, scoreB_curve] = coarse_theta_by_lane_spatialMF(Zant_fix, nB, mB, thetaGridCoarse, Nr, d, lambda, dR);
+
+fprintf('Coarse (lane-consistent) theta: LaneA=%.2f deg, LaneB=%.2f deg\n', thetaA_coarse, thetaB_coarse);
+
+figure('Name','Coarse Angle Score (lane-consistent spatial MF)');
+plot(thetaGridCoarse, 10*log10(scoreA_curve/max(scoreA_curve)+1e-12), 'LineWidth',1.4); hold on;
+plot(thetaGridCoarse, 10*log10(scoreB_curve/max(scoreB_curve)+1e-12), '--','LineWidth',1.4);
+grid on; xlabel('Angle (deg)'); ylabel('Normalized score (dB)');
+title('Coarse angle selection uses ONLY lane-gated DD cells');
+legend('Lane A','Lane B','Location','best');
+xline(veh(1).theta,'--','Truck(A)'); xline(veh(2).theta,'--','Car(B)');
+xline(sc(1).theta,':','Sc1'); xline(sc(2).theta,':','Sc2');
+
+%% ========================================================================
+%  Stage-2: build LOCAL covariance around confirmed DD cell, then MUSIC refine
+%% ========================================================================
+useSpatialSmoothing = true;
+Lsub = Nr-1;
+Ksig = 1;
+
+RA_local = cov_from_local_dd(Zant_fix, nA_star, mA_star, dNd_local, dMd_local, dR, Nr);
+RB_local = cov_from_local_dd(Zant_fix, nB_star, mB_star, dNd_local, dMd_local, dR, Nr);
+
+RA_use = RA_local; RB_use = RB_local;
+NrA = Nr; NrB = Nr;
+if useSpatialSmoothing
+    RA_use = spatial_smooth_ula(RA_local, Lsub);
+    RB_use = spatial_smooth_ula(RB_local, Lsub);
+    NrA = size(RA_use,1);
+    NrB = size(RB_use,1);
+end
+
+% -------- MUSIC precision parameters --------
+thetaFineHalfSpan = 3;     % deg
+thetaFineStep     = 0.01;  % deg  (try 0.005 if you want)
+
+thetaGridA_fine = (thetaA_coarse-thetaFineHalfSpan):thetaFineStep:(thetaA_coarse+thetaFineHalfSpan);
+thetaGridB_fine = (thetaB_coarse-thetaFineHalfSpan):thetaFineStep:(thetaB_coarse+thetaFineHalfSpan);
+
+PmA = music_spectrum_from_R(RA_use, thetaGridA_fine, NrA, d, lambda, Ksig);
+PmB = music_spectrum_from_R(RB_use, thetaGridB_fine, NrB, d, lambda, Ksig);
+
+[~,ia] = max(PmA);
+[~,ib] = max(PmB);
+
+thetaA_ref = parabolic_peak_refine(thetaGridA_fine, PmA, ia);
+thetaB_ref = parabolic_peak_refine(thetaGridB_fine, PmB, ib);
+
+fprintf('Refined MUSIC theta: LaneA=%.3f deg, LaneB=%.3f deg\n', thetaA_ref, thetaB_ref);
+
+%% ========================================================================
+%  Beamforming (MVDR) using refined angles
+%% ========================================================================
+a1 = steering_ula(Nr, d, lambda, thetaA_ref);
+a2 = steering_ula(Nr, d, lambda, thetaB_ref);
+
+Y = yRx;
+Rxx = (Y * Y') / Nsamp;
+delta = 1e-2 * trace(Rxx) / Nr;
+RxxL = Rxx + delta * eye(Nr);
+
+w1 = mvdr_weights(RxxL, a1);
+w2 = mvdr_weights(RxxL, a2);
+
+s1 = (w1') * yRx;   s1 = s1(:);
+s2 = (w2') * yRx;   s2 = s2(:);
+wOmni = ones(Nr,1)/sqrt(Nr);
+s0 = (wOmni') * yRx; s0 = s0(:);
+
+%% ========================================================================
+%  OTFS demod + DD MF (ONLY ONCE PER STREAM)
+%% ========================================================================
+Xspec = fft2(Xdd);
+
+Ydd0 = otfs_zp_demod_rect(s0, N, M, Lzp);
+Zdd0 = ifft2( fft2(Ydd0) .* conj(Xspec) );
+
+Ydd1 = otfs_zp_demod_rect(s1, N, M, Lzp);
+Zdd1 = ifft2( fft2(Ydd1) .* conj(Xspec) );
+
+Ydd2 = otfs_zp_demod_rect(s2, N, M, Lzp);
+Zdd2 = ifft2( fft2(Ydd2) .* conj(Xspec) );
+
+%% ========================================================================
+%  Physical axes + delay wrap-fix + range cropping
+%% ========================================================================
+mIdx = 0:(M-1);
+RAxis_m_full = (c*(mIdx/Fs))/2;
+nCentered = (-N/2):(N/2-1);
+vAxis_ms = ((nCentered*dNu)*lambda)/2;
+
+Rmax_plot = 180;
+Mkeep = min(M, floor((2*Rmax_plot/c)*Fs) + 1);
+RAxis_m = RAxis_m_full(1:Mkeep);
+
+%% ========================================================================
+%  Plot: DD MF magnitude (omni / MVDR@LaneA / MVDR@LaneB) + Lane labels
+%  (NO A*/B* circle/square markers)
+%% ========================================================================
+figure('Name','DD-MF magnitude (omni vs MVDR streams) + Lane labels');
+titles = {'Omni', sprintf('MVDR LaneA \\theta=%.2f°',thetaA_ref), sprintf('MVDR LaneB \\theta=%.2f°',thetaB_ref)};
+Zs = {Zdd0, Zdd1, Zdd2};
+
+for k = 1:3
+    Z = fftshift(Zs{k}, 1);
+    Zfix = local_wrapfix_map(Z, N, M);
+    Zfix = Zfix(:, 1:Mkeep);
+
+    ZdB  = 20*log10(abs(Zfix)/max(abs(Zfix(:))) + 1e-12);
+
+    subplot(1,3,k);
+    imagesc(RAxis_m, vAxis_ms, ZdB);
+    axis xy; colorbar; caxis([-45 0]);
+    title(titles{k});
+    xlabel('Range (m)'); ylabel('Radial velocity (m/s)');
+
+    hold on;
+
+    % Lane bands
+    yl = ylim;
+    patch([R_laneA_min R_laneA_max R_laneA_max R_laneA_min], ...
+          [yl(1) yl(1) yl(2) yl(2)], 'w', 'FaceAlpha',0.06, 'EdgeColor','none');
+    patch([R_laneB_min R_laneB_max R_laneB_max R_laneB_min], ...
+          [yl(1) yl(1) yl(2) yl(2)], 'w', 'FaceAlpha',0.06, 'EdgeColor','none');
+
+    % Boundaries + gap
+    xline(R_laneA_min,'w--','LineWidth',1.0); xline(R_laneA_max,'w--','LineWidth',1.0);
+    xline(R_laneB_min,'w-.','LineWidth',1.0); xline(R_laneB_max,'w-.','LineWidth',1.0);
+    xline(R_gap_min,'w:','LineWidth',1.0);    xline(R_gap_max,'w:','LineWidth',1.0);
+
+    % Labels
+    text(mean([R_laneA_min R_laneA_max]), yl(2)*0.85, 'Lane A', ...
+        'Color','w','FontWeight','bold','HorizontalAlignment','center');
+    text(mean([R_laneB_min R_laneB_max]), yl(2)*0.85, 'Lane B', ...
+        'Color','w','FontWeight','bold','HorizontalAlignment','center');
+
+    hold off;
+end
+
+disp('Finished.');
+
+%% ========================================================================
+%  Refinement plots (separate figures, x-axis tightened)
+%% ========================================================================
+PmA_dB = 10*log10(PmA./max(PmA) + 1e-12);
+PmB_dB = 10*log10(PmB./max(PmB) + 1e-12);
+
+padA = 1.0; padB = 1.0;
+xlimA = [max(min(thetaGridA_fine), thetaA_ref - padA), min(max(thetaGridA_fine), thetaA_ref + padA)];
+xlimB = [max(min(thetaGridB_fine), thetaB_ref - padB), min(max(thetaGridB_fine), thetaB_ref + padB)];
+
+figure('Name','Lane A MUSIC refinement');
+plot(thetaGridA_fine, PmA_dB, 'LineWidth', 1.4); grid on;
+xlabel('\theta (deg)'); ylabel('Normalized MUSIC spectrum (dB)');
+title(sprintf('Lane A refinement (coarse %.2f° → refined %.3f°)', thetaA_coarse, thetaA_ref));
+ylim([-30 0]); xlim(xlimA);
+xline(thetaA_coarse, '--', 'coarse', 'LabelVerticalAlignment','bottom');
+xline(thetaA_ref,   '-',  'refined','LabelVerticalAlignment','top');
+
+figure('Name','Lane B MUSIC refinement');
+plot(thetaGridB_fine, PmB_dB, 'LineWidth', 1.4); grid on;
+xlabel('\theta (deg)'); ylabel('Normalized MUSIC spectrum (dB)');
+title(sprintf('Lane B refinement (coarse %.2f° → refined %.3f°)', thetaB_coarse, thetaB_ref));
+ylim([-30 0]); xlim(xlimB);
+xline(thetaB_coarse, '--', 'coarse', 'LabelVerticalAlignment','bottom');
+xline(thetaB_ref,   '-',  'refined','LabelVerticalAlignment','top');
+
+%% ===================== Local functions ===========================
+
+function x = otfs_zp_mod_rect(Xdd, N, M, Lzp)
+    X1  = fft(Xdd, [], 1)/sqrt(N);
+    Xtf = ifft(X1,  [], 2)*sqrt(M);
+    blkLen = M + Lzp;
+    x = zeros(N*blkLen, 1);
+    idx = 1;
+    for n = 1:N
+        xn = ifft(Xtf(n,:).', M);
+        x(idx:idx+blkLen-1) = [xn; zeros(Lzp,1)];
+        idx = idx + blkLen;
+    end
+end
+
+function Ydd = otfs_zp_demod_rect(y, N, M, Lzp)
+    blkLen = M + Lzp;
+    Ytf = zeros(N, M);
+    idx = 1;
+    for n = 1:N
+        yn = y(idx:idx+blkLen-1);
+        yn = yn(1:M);
+        Ytf(n,:) = fft(yn, M).';
+        idx = idx + blkLen;
+    end
+    Y1  = ifft(Ytf, [], 1)*sqrt(N);
+    Ydd = fft(Y1,  [], 2)/sqrt(M);
+end
+
+function a = steering_ula(N, d, lambda, theta_deg)
+    theta = deg2rad(theta_deg);
+    n = (0:N-1).';
+    a = exp(1j*2*pi*(d/lambda)*n*sin(theta));
+    a = a / sqrt(N);
+end
+
+function y = frac_delay_linear(x, tau, Fs)
+    N = length(x);
+    tt = (0:N-1).' / Fs;
+    tShift = tt - tau;
+    y = interp1(tt, x, tShift, 'linear', 0);
+end
+
+function w = mvdr_weights(Rxx, a)
+    x = Rxx \ a;
+    w = x / (a' * x);
+end
+
+function Zfix = local_wrapfix_map(Zs, N, M)
+    Zfix = zeros(N,M);
+    for m0 = 0:(M-1)
+        mTrue0 = mod(M - m0, M);
+        Zfix(:, mTrue0+1) = Zs(:, m0+1);
+    end
+end
+
+function nGate = estimate_motion_doppler_gate(Zant_fix, m_list, n0, dNk)
+    N = size(Zant_fix,1);
+    En = zeros(N,1);
+    for n = 1:N
+        if n == n0, continue; end
+        tmp = Zant_fix(n, m_list, :);
+        En(n) = sum(abs(tmp(:)).^2);
+    end
+    [~, nPeak] = max(En);
+    nGate = max(1, nPeak-dNk) : min(N, nPeak+dNk);
+end
+
+function [nStar, mStar, metricStar] = pick_ddcell_in_lane(Zant_fix, n_list, m_list, dR)
+    metricStar = -inf; nStar = n_list(1); mStar = m_list(1);
+    for m = m_list
+        Rcell = max((m-1)*dR, 1);
+        for n = n_list
+            z = squeeze(Zant_fix(n,m,:));
+            metric = sum(abs(z).^2) * (Rcell^4);
+            if metric > metricStar
+                metricStar = metric;
+                nStar = n; mStar = m;
+            end
+        end
+    end
+end
+
+function [thetaBest, scoreCurve] = coarse_theta_by_lane_spatialMF(Zant_fix, n_list, m_list, thetaGrid, Nr, d, lambda, dR)
+    scoreCurve = zeros(size(thetaGrid));
+    for ii = 1:numel(thetaGrid)
+        a = steering_ula(Nr, d, lambda, thetaGrid(ii));
+        best = -inf;
+        for m = m_list
+            Rcell = max((m-1)*dR, 1);
+            for n = n_list
+                z = squeeze(Zant_fix(n,m,:));
+                s = abs(a' * z).^2 * (Rcell^4);
+                if s > best, best = s; end
+            end
+        end
+        scoreCurve(ii) = best;
+    end
+    [~,im] = max(scoreCurve);
+    thetaBest = thetaGrid(im);
+end
+
+function Rgate = cov_from_local_dd(Zant_fix, n0, m0, dN, dM, dR, Nr)
+    N = size(Zant_fix,1);
+    M = size(Zant_fix,2);
+    nList = max(1,n0-dN):min(N,n0+dN);
+    mList = max(1,m0-dM):min(M,m0+dM);
+
+    S = [];
+    for m = mList
+        Rcell = max((m-1)*dR, 1);
+        for n = nList
+            z = squeeze(Zant_fix(n,m,:));
+            S = [S, z*(Rcell^2)]; %#ok<AGROW>
+        end
+    end
+
+    L = max(1,size(S,2));
+    Rgate = (S*S')/L;
+
+    dl = 1e-3 * trace(Rgate)/Nr;
+    Rgate = Rgate + dl*eye(Nr);
+end
+
+function Rss = spatial_smooth_ula(R, Lsub)
+    Nr = size(R,1);
+    L = max(2, min(Lsub, Nr));
+    K = Nr - L + 1;
+
+    Rss = zeros(L,L);
+    for k = 1:K
+        J = zeros(L, Nr);
+        J(:, k:k+L-1) = eye(L);
+        Rss = Rss + J*R*J';
+    end
+    Rss = Rss / K;
+
+    dl = 1e-3 * trace(Rss)/L;
+    Rss = Rss + dl*eye(L);
+end
+
+function Pmusic = music_spectrum_from_R(R, thetaGrid, NrEff, d, lambda, Ksig)
+    Rh = (R + R')/2;
+    [V,D] = eig(Rh);
+    [~,ord] = sort(real(diag(D)), 'descend');
+    V = V(:,ord);
+
+    Ksig = max(1, min(Ksig, NrEff-1));
+    En = V(:, Ksig+1:end);
+
+    Pmusic = zeros(size(thetaGrid));
+    for ii = 1:numel(thetaGrid)
+        a = steering_ula(NrEff, d, lambda, thetaGrid(ii));
+        denom = real(a'*(En*En')*a);
+        Pmusic(ii) = real(1/(denom + 1e-15));
+    end
+end
+
+function thHat = parabolic_peak_refine(thGrid, P, idx)
+    if idx <= 1 || idx >= numel(P)
+        thHat = thGrid(idx);
+        return;
+    end
+    y1 = real(P(idx-1)); y2 = real(P(idx)); y3 = real(P(idx+1));
+    denom = (y1 - 2*y2 + y3);
+    if abs(denom) < 1e-18
+        thHat = thGrid(idx);
+        return;
+    end
+    delta = 0.5*(y1 - y3)/denom;
+    delta = max(-1, min(1, delta));
+    dth = thGrid(2) - thGrid(1);
+    thHat = thGrid(idx) + delta*dth;
+end
